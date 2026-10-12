@@ -69,7 +69,12 @@ PATIENT_PICKLE = os.path.join(VECTOR_STORE_DIR, "patient_items.pkl")
 # ---------------------------
 @st.cache_resource
 def load_model():
-    return SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)
+    m = SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)
+    # Ensure every submodule (including NomicBertModel) has get_extended_attention_mask
+    for module in m.modules():
+        if not hasattr(module, "get_extended_attention_mask"):
+            module.get_extended_attention_mask = _patch_extended_attention_mask.__get__(module, module.__class__)
+    return m
 
 try:
     model = load_model()
