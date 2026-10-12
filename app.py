@@ -2,11 +2,38 @@ import streamlit as st
 import json
 import pickle
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
 import os
+import torch
+import transformers
+from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
+
+# ---------------------------
+# Compatibility Patch for NomicBERT
+# ---------------------------
+# In transformers >= 4.45 / 5.x, get_extended_attention_mask was removed from PreTrainedModel.
+# We patch it to maintain full backwards compatibility for nomic-embed-text-v1.5.
+def _patch_extended_attention_mask(self, attention_mask, input_shape=None, device=None, dtype=None):
+    if dtype is None:
+        dtype = getattr(self, "dtype", torch.float32)
+    if attention_mask is None:
+        return None
+    if attention_mask.dim() == 3:
+        extended_attention_mask = attention_mask[:, None, :, :]
+    elif attention_mask.dim() == 2:
+        extended_attention_mask = attention_mask[:, None, None, :]
+    else:
+        extended_attention_mask = attention_mask
+    extended_attention_mask = extended_attention_mask.to(dtype=dtype)
+    min_val = -10000.0 if dtype in (torch.float16, torch.bfloat16) else -1e9
+    return (1.0 - extended_attention_mask) * min_val
+
+if not hasattr(transformers.PreTrainedModel, "get_extended_attention_mask"):
+    transformers.PreTrainedModel.get_extended_attention_mask = _patch_extended_attention_mask
+if not hasattr(torch.nn.Module, "get_extended_attention_mask"):
+    torch.nn.Module.get_extended_attention_mask = _patch_extended_attention_mask
 
 # ---------------------------
 # Page Config
@@ -22,9 +49,18 @@ st.set_page_config(
 # ---------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VECTOR_STORE_DIR = os.path.join(BASE_DIR, "vector_store")
-DATA_PATH = os.path.join(BASE_DIR,"mimic-iv-ext-direct-1.0.0","My_Dataset","combined_rag_data.json")
-KB_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "kb_index.faiss")
-CASES_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "patient_index.faiss")
+DATA_PATH = os.path.join(BASE_DIR, "mimic-iv-ext-direct-1.0.0", "My_Dataset", "combined_rag_data.json")
+
+# Use 768-dimensional indices that match nomic-embed-text-v1.5
+KB_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "medical_kb_index.faiss")
+CASES_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "patient_cases_index.faiss")
+
+# Fallback to legacy index names if 768D indices do not exist
+if not os.path.exists(KB_FAISS_PATH) and os.path.exists(os.path.join(VECTOR_STORE_DIR, "kb_index.faiss")):
+    KB_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "kb_index.faiss")
+if not os.path.exists(CASES_FAISS_PATH) and os.path.exists(os.path.join(VECTOR_STORE_DIR, "patient_index.faiss")):
+    CASES_FAISS_PATH = os.path.join(VECTOR_STORE_DIR, "patient_index.faiss")
+
 KB_PICKLE = os.path.join(VECTOR_STORE_DIR, "kb_items.pkl")
 PATIENT_PICKLE = os.path.join(VECTOR_STORE_DIR, "patient_items.pkl")
 
@@ -89,8 +125,6 @@ try:
     kb_items, patient_items, load_msg = load_data()
     if "JSON" in load_msg:
         st.info(f"{load_msg}: {len(kb_items)} KB items, {len(patient_items)} cases")
-    # else:
-    #     st.success(f"{load_msg}: {len(kb_items)} KB items, {len(patient_items)} cases")
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -103,10 +137,14 @@ def load_faiss_index(index_path, items, key_name, _model):
     rebuild = True
     index = None
     
+    # Safely get expected embedding dimension across sentence_transformers versions
+    dim_fn = getattr(_model, "get_embedding_dimension", getattr(_model, "get_sentence_embedding_dimension", None))
+    expected_dim = dim_fn() if dim_fn else 768
+
     if os.path.exists(index_path):
         try:
             index = faiss.read_index(index_path)
-            if index.d == _model.get_sentence_embedding_dimension():
+            if index.d == expected_dim:
                 rebuild = False
             else:
                 pass # Dimension mismatch, rebuild
@@ -169,7 +207,7 @@ def retrieve(query, k_kb=2, k_cases=2):
 # ---------------------------
 def generate_answer(query, api_key, k_kb=2, k_cases=2):
     if not api_key:
-        return "Please enter GEMINI_API_KEY in .env", [], 0.0
+        return "Please configure GEMINI_API_KEY in .env or Streamlit Secrets", [], 0.0
 
     genai.configure(api_key=api_key)
     retrieved = retrieve(query, k_kb=k_kb, k_cases=k_cases)
@@ -182,10 +220,9 @@ def generate_answer(query, api_key, k_kb=2, k_cases=2):
                 kb_text = item.get('medicalKB', 'No content')
                 context_parts.append(f"- [KB: {item_id}] {kb_text} (Relevance: {score:.2f})")
             else:
-                # Patient case has nested structure - extract the relevant information
+                # Patient case has nested structure - extract relevant information
                 item_id = item.get('id', f'CASE_{idx}')
                 case_data = item.get('patient_case', {})
-                # Combine all inputs into a readable format
                 inputs = case_data.get('inputs', {})
                 inputs_text = " | ".join([f"{k}: {v}" for k, v in inputs.items() if v and v != "None"])
                 case_summary = f"Disease: {case_data.get('specific_disease', 'Unknown')} | {inputs_text[:500]}"
@@ -198,19 +235,21 @@ def generate_answer(query, api_key, k_kb=2, k_cases=2):
     avg_score = sum(score for _, _, score in retrieved)/len(retrieved) if retrieved else 0.0
 
     prompt = f"""
-You are a medical expert.
-Use the following knowledge base and similar patient cases to answer the patient query.
+You are an expert AI clinical diagnostic assistant. You must analyze patient presentations strictly using evidence retrieved from verified clinical guidelines and historical patient precedents.
 
+### Retrieved Context:
 {context_str}
 
-Patient Query:
+### Current Patient Presentation:
 {query}
 
-Structure response:
-1. EXTRACTED INFO: summarize key info from KB and cases
-2. DIAGNOSIS: give clear diagnosis
-3. REASONING: support diagnosis with bullets, reference symptoms
+### Diagnostic Instructions:
+1. Identify and list the patient's critical risk factors, symptoms, abnormal vitals, and cardiac biomarkers (e.g., troponin levels, ECG changes).
+2. Compare the presentation against the retrieved clinical guidelines and matching historical patient cases above.
+3. State the most likely diagnosis clearly with your step-by-step clinical justification.
+4. If the retrieved evidence is insufficient or contradictory, explicitly state that additional diagnostic workup (e.g., repeat serial troponins, urgent angiography) is required.
 """
+
     try:
         gemini_model = genai.GenerativeModel("gemini-2.0-flash")
         response = gemini_model.generate_content(prompt)
@@ -227,6 +266,11 @@ st.markdown("---")
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        pass
 
 # Initialize session state
 if "input_text" not in st.session_state:

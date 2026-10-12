@@ -1,4 +1,4 @@
-transformers
+transformers<4.45.0
 accelerate
 sentence-transformers
 faiss-cpu
@@ -7,6 +7,5 @@ einops
 streamlit
 python-dotenv
 huggingface-hub
-numpy
-python-dotenv
+numpy<2.0.0
 google-generativeai
