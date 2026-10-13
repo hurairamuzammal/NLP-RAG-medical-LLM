@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import pickle
+import re
 from dotenv import load_dotenv
 import numpy as np
 import faiss
@@ -208,14 +209,58 @@ def retrieve(query, k_kb=2, k_cases=2):
     return results
 
 # ---------------------------
+# Patient Data Sanitization (PII De-identification)
+# ---------------------------
+def sanitize_patient_text(text: str) -> tuple[str, bool]:
+    """
+    Sanitizes patient clinical presentation text by masking patient names,
+    salutations, and record IDs to protect patient privacy (PII) and prevent
+    irrelevant personal identifiers from biasing vector similarity search.
+    """
+    if not text:
+        return text, False
+    original = text
+    # 1. Explicit labels: 'Name: John Doe', 'Patient Name: Jane Smith', 'Pt Name: Bob'
+    text = re.sub(
+        r'(?i)\b(patient\s*name|pt\s*name|name)\s*:\s*[A-Za-z\s\.\-]+(?=(?:,|\.|\n|$))',
+        r'\1: [REDACTED]',
+        text
+    )
+    # 2. Salutations: Mr. John Doe, Mrs. Jane Smith, Dr. Alice Brown
+    text = re.sub(
+        r'\b(Mr\.|Mrs\.|Ms\.|Miss|Dr\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b',
+        r'[PATIENT_REDACTED]',
+        text
+    )
+    # 3. 'Patient <Capitalized Name>' (avoiding common clinical verbs & stop words)
+    common_stops = (
+        'presented|admitted|complaining|complains|reported|reports|denied|denies|'
+        'diagnosed|arrived|received|developed|underwent|undergoing|demonstrated|'
+        'scheduled|referred|is|was|has|had|who|with|in|at|on|for|from|to|a|an|the|'
+        'status|post|history'
+    )
+    pattern = rf'\b(?:Patient|Pt)\s+(?!(?:{common_stops})\b)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b'
+    text = re.sub(pattern, r'Patient [REDACTED]', text)
+    # 4. MRN or ID patterns: MRN: 1234567, Patient ID: #98765
+    text = re.sub(
+        r'(?i)\b(mrn|medical\s*record\s*(?:number|num|#)?|patient\s*id|patient\s*#|id\s*#?)\s*[:#]\s*[A-Z0-9-]+\b',
+        r'\1: [ID_REDACTED]',
+        text
+    )
+    return text, (text != original)
+
+# ---------------------------
 # Gemini API Function
 # ---------------------------
 def generate_answer(query, api_key, k_kb=2, k_cases=2):
     if not api_key:
-        return "Please configure GEMINI_API_KEY in .env or Streamlit Secrets", [], 0.0
+        return "Please configure GEMINI_API_KEY in .env or Streamlit Secrets", [], 0.0, "None"
 
     genai.configure(api_key=api_key)
-    retrieved = retrieve(query, k_kb=k_kb, k_cases=k_cases)
+    
+    # Sanitize patient presentation prior to retrieval and prompt construction
+    clean_query, _ = sanitize_patient_text(query)
+    retrieved = retrieve(clean_query, k_kb=k_kb, k_cases=k_cases)
 
     context_parts = []
     for idx, (source_type, item, score) in enumerate(retrieved):
@@ -246,7 +291,7 @@ You are an expert AI clinical diagnostic assistant. You must analyze patient pre
 {context_str}
 
 ### Current Patient Presentation:
-{query}
+{clean_query}
 
 ### Diagnostic Instructions:
 1. Identify and list the patient's critical risk factors, symptoms, abnormal vitals, and cardiac biomarkers (e.g., troponin levels, ECG changes).
@@ -255,12 +300,32 @@ You are an expert AI clinical diagnostic assistant. You must analyze patient pre
 4. If the retrieved evidence is insufficient or contradictory, explicitly state that additional diagnostic workup (e.g., repeat serial troponins, urgent angiography) is required.
 """
 
-    try:
-        gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-        response = gemini_model.generate_content(prompt)
-        return response.text, retrieved, avg_score
-    except Exception as e:
-        return f"Error: {str(e)}", [], 0.0
+    candidate_models = []
+    env_model = os.getenv("GEMINI_MODEL")
+    if env_model:
+        candidate_models.append(env_model)
+    # Target gemini-3.8-flash as primary, followed by reliable fallbacks
+    for m in ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-1.5-flash"]:
+        if m not in candidate_models:
+            candidate_models.append(m)
+
+    last_err = None
+    response_text = None
+    model_used = None
+    for model_name in candidate_models:
+        try:
+            gemini_model = genai.GenerativeModel(model_name)
+            response = gemini_model.generate_content(prompt)
+            response_text = response.text
+            model_used = model_name
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if response_text is None:
+        return f"Error connecting to Gemini API: {str(last_err)}", [], 0.0, "Failed"
+    return response_text, retrieved, avg_score, model_used
 
 # ---------------------------
 # Streamlit UI
@@ -315,8 +380,13 @@ st.caption("⚠️ Privacy Notice: Please avoid entering patient names or any se
 
 if st.button("Diagnose"):
     if user_input.strip():
-        with st.spinner("Analyzing..."):
-            answer, retrieved_items, avg_score = generate_answer(user_input, api_key)
+        # Check and sanitize PII before running analysis
+        clean_input, was_sanitized = sanitize_patient_text(user_input)
+        if was_sanitized:
+            st.info("🛡️ **Privacy Shield Active:** Personal identifying details (patient name/ID) were automatically detected and masked before running FAISS search and AI diagnosis.")
+
+        with st.spinner("Analyzing with Gemini..."):
+            answer, retrieved_items, avg_score, model_used = generate_answer(clean_input, api_key)
         
         st.markdown("### Retrieved Knowledge & Similar Cases")
         for idx, (source_type, item, score) in enumerate(retrieved_items, 1):
@@ -345,6 +415,8 @@ if st.button("Diagnose"):
                 st.error(f"Error displaying item {idx}: {e}")
         
         st.markdown("### AI Response")
+        if model_used and model_used not in ("None", "Failed"):
+            st.caption(f"🤖 Powered by `{model_used}`")
         st.write(answer)
 
         st.markdown(f"**Average Relevance Score:** {avg_score:.2f}")
